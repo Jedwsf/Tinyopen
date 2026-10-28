@@ -1,12 +1,27 @@
 // =============================================================================
 // core/launcher.cpp — 启动器实现
-// -----------------------------------------------------------------------------
-// 打开流程（launch）：
-//   1) 空路径 → 记失败
-//   2) 网址   → ShellExecuteW 交给默认浏览器（不做文件存在性检查、不限长度）
-//   3) 文件   → 先按「启动间隔」延时 → 检查是否存在 → ShellExecuteW 默认程序打开
-//                若默认程序失败，再退回用记事本打开
-// 核心 API：ShellExecuteW 返回值 > 32 表示成功（<=32 为错误码）。
+// =============================================================================
+//
+// 【打开流程（launch）】
+//   1) 路径为空              → 记「失败：路径为空」
+//   2) 网址                  → 等待启动间隔 → ShellExecuteW 交给默认浏览器
+//                              （不检查文件存在性，也不受路径长度限制）
+//   3) 本地文件              → 等待启动间隔 → 检查是否存在
+//                              → ShellExecuteW 用默认程序打开
+//                              → 失败则退回用记事本打开
+//                              → 仍失败则按错误码记录原因
+//
+// 【核心 API】
+//   ShellExecuteW(...) 返回值 > 32 表示成功；<= 32 是错误码
+//   （SE_ERR_ACCESSDENIED = 5、SE_ERR_NOASSOC = 31 等）。
+//   统一传 SW_SHOWNORMAL，保证目标窗口正常显示而不是最小化。
+//
+// 【函数一览】
+//   Launcher()          保存 logger / config 指针
+//   ensureDisplayName() 取日志用的显示名（displayName 为空则退回文件名）
+//   waitLaunchDelay()   按设置里的启动间隔 msleep（0 表示不等待）
+//   launch()            打开单个条目，返回是否成功
+//   launchGroup()       按顺序打开一个分组里的全部条目
 // =============================================================================
 
 #include "launcher.h"
@@ -35,6 +50,14 @@ QString Launcher::ensureDisplayName(const FileEntry &entry) const
     return QFileInfo(entry.path).fileName();
 }
 
+// 按设置里的「启动间隔」等待一段时间（0 表示不等待）
+void Launcher::waitLaunchDelay() const
+{
+    const int delay = m_config ? m_config->delayMs() : 0;
+    if (delay > 0)
+        QThread::msleep(static_cast<unsigned long>(delay));
+}
+
 // 启动单个条目（本地文件 / 网址），返回是否成功；过程与结果均写入日志
 bool Launcher::launch(const FileEntry &entry, const QString &groupName)
 {
@@ -52,10 +75,7 @@ bool Launcher::launch(const FileEntry &entry, const QString &groupName)
     if (looksLikeUrl(path)) {
         const QString url = normalizeUrl(path);
 
-        // 启动前的固定延迟（设置里的启动间隔）
-        const int delay = m_config ? m_config->delayMs() : 0;
-        if (delay > 0)
-            QThread::msleep(static_cast<unsigned long>(delay));
+        waitLaunchDelay();   // 启动前的固定延迟（设置里的启动间隔）
 
 #ifdef Q_OS_WIN
         const std::wstring wUrl = url.toStdWString();
@@ -78,9 +98,7 @@ bool Launcher::launch(const FileEntry &entry, const QString &groupName)
     }
 
     // 3. 启动前的固定延迟（设置里的启动间隔）
-    const int delay = m_config ? m_config->delayMs() : 0;
-    if (delay > 0)
-        QThread::msleep(static_cast<unsigned long>(delay));
+    waitLaunchDelay();
 
     const QFileInfo fi(path);
     const bool exists = fi.exists();

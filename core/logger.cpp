@@ -1,8 +1,24 @@
 // =============================================================================
 // core/logger.cpp — 后台记录器实现
-// -----------------------------------------------------------------------------
-// 每行格式：「[yyyy-MM-dd HH:mm:ss] [分类] 正文」
-// 文件位置：程序目录/tinylog.txt，UTF-8 编码。
+// =============================================================================
+//
+// 【存储格式】
+//   文件：程序目录 / tinylog.txt（UTF-8）
+//   每行：[yyyy-MM-dd HH:mm:ss] [分类] 正文
+//   分类：信息 / 成功 / 失败 / 记事本
+//
+// 【函数一览】
+//   Logger()          构造即清空旧记录（实现「只记本次运行」）
+//   kFilePath()       返回「程序目录/tinylog.txt」
+//   append()          追加一行（超上限丢最早一行）并立即落盘
+//   info()            记「信息」
+//   success()         记「成功」
+//   notepad()         记「记事本」（无默认程序、退回记事本打开）
+//   fail()            记「失败」，可附「原因：…」
+//   setRaw()          用一组现成记录覆盖内存内容（预留接口，目前未使用）
+//   toDisplayText()   拼成多行文本供 LogDialog 展示；空时返回「（暂无记录）」
+//   clear()           清空并落盘
+//   save()            整体重写文件（UTF-8）
 // =============================================================================
 
 #include "logger.h"
@@ -34,7 +50,8 @@ void Logger::append(const QString &tag, const QString &msg)
     const QString ts = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
     const QString line = QString("[%1] [%2] %3").arg(ts, tag, msg);
     m_lines << line;
-    while (m_lines.size() > kMaxLines)
+    // 每次只加一行，超出上限时删掉最早的一行即可（用 if 就够，不必 while）
+    if (m_lines.size() > kMaxLines)
         m_lines.removeFirst();
     save();
 }
