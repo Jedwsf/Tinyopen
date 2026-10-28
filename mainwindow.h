@@ -1,13 +1,35 @@
 // =============================================================================
-// mainwindow.h — 主窗口
-// -----------------------------------------------------------------------------
-// 整个软件的「总指挥」：顶部是工具栏（标题 + 新建分组/设置/状况 三个图标按钮），
-// 下方是可滚动的分组列表。负责：
-//   * 从 ConfigStore 还原分组、把分组变化写回 ConfigStore；
-//   * 协调 GroupWidget 的各请求信号（增删文件、启动、编辑）到 Launcher；
-//   * 处理「拖文件到空白处 → 新建分组」；
-//   * 处理「拖动分组标题栏 → 在列表里换位置」（含插入指示线）；
-//   * 启动后按分组的 autoLaunch 标记执行开机自启。
+// mainwindow.h — 主窗口（整个程序的调度中枢）
+// =============================================================================
+//
+// 【职责】
+//   顶部是工具栏（标题 + 新建分组 / 设置 / 状况 三个图标按钮），
+//   下方是可滚动的分组列表。具体负责：
+//     * 从 ConfigStore 还原分组，并把分组变化写回 ConfigStore；
+//     * 把 GroupWidget 的各种请求（增删文件、启动、编辑）转给 Launcher 或弹窗；
+//     * 处理「拖文件到空白处 → 新建分组」；
+//     * 处理「拖动分组标题栏 → 在列表里换位置」（含蓝色插入指示线）；
+//     * 启动后按每个分组的 autoLaunch 标记执行开机自启。
+//
+// 【类结构】
+//   公有   ：构造 / 析构
+//   受保护 ：dragEnterEvent / dropEvent / eventFilter —— 都是 Qt 回调，不主动调用
+//   私有槽 ：全部业务处理（函数清单见 mainwindow.cpp 顶部）
+//   私有成员：
+//       m_config / m_logger / m_launcher   三个 core 模块
+//       m_groupLayout / m_groupHost / m_scroll  界面容器
+//       m_dragGroup / m_dropIndicator / m_indicatorIndex  拖动换位状态
+//       m_batchDepth   批量操作计数（>0 时不写盘）
+//
+// 【信号接线】（全部在 addGroupPanel() 里一次性连好）
+//   GroupWidget::requestDelete     → onGroupDelete      删除分组
+//   GroupWidget::requestLaunch     → onGroupLaunch      启动整组
+//   GroupWidget::requestLaunchFile → onGroupLaunchFile  启动某一行
+//   GroupWidget::requestEditFile   → onGroupEditFile    编辑某一行
+//   GroupWidget::requestAddFiles   → onGroupAddFiles    「+」添加
+//   GroupWidget::changed           → onAnyChanged       任何改动 → 保存
+//   GroupWidget::dragStarted       → 记录 m_dragGroup
+//   GroupWidget::dragFinished      → 清空 m_dragGroup 并隐藏指示线
 // =============================================================================
 
 #ifndef MAINWINDOW_H
@@ -79,8 +101,11 @@ private:
     QWidget     *m_groupHost   = nullptr;  // 分组面板的容器
     QScrollArea *m_scroll      = nullptr;  // 滚动区域
 
-    GroupWidget *m_dragGroup = nullptr;    // 当前正在被拖动的分组（拖动中才有值）
+    GroupWidget *m_dragGroup = nullptr;      // 当前正在被拖动的分组（拖动中才有值）
     QFrame      *m_dropIndicator = nullptr;  // 拖动时显示的插入指示线
+
+    int m_batchDepth = 0;       // >0 表示正在批量操作：期间只同步内存、不写盘，结束后统一保存一次
+    int m_indicatorIndex = -1;  // 插入指示线当前所在的下标（-1 表示未显示），用于跳过无谓的布局重排
 };
 
 #endif // MAINWINDOW_H

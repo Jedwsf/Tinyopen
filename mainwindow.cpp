@@ -1,9 +1,63 @@
 // =============================================================================
-// mainwindow.cpp — 主窗口实现
-// -----------------------------------------------------------------------------
-// 界面自上而下：工具栏（标题+图标按钮）→ 可滚动分组列表。
-// 数据流：GroupWidget 发出请求信号 → MainWindow 槽函数处理 →
-//         调用 Launcher 启动 / 弹出对话框 / 改动后 onAnyChanged() 保存配置。
+// mainwindow.cpp — 主窗口实现（整个程序的调度中枢）
+// =============================================================================
+//
+// 【在项目中的位置】
+//   main.cpp 创建本窗口。它向下持有 GroupWidget（分组面板）与三个弹窗，
+//   向内持有 ConfigStore / Logger / Launcher 三个 core 模块。
+//   几乎所有跨模块的动作都经过这里：
+//       面板发出请求信号 → 本类处理 → 调 core 模块或弹对话框 → 变化后统一保存。
+//
+// 【界面结构】
+//   QMainWindow
+//   └─ central (QWidget，浅灰底 #f7f8fa)
+//      └─ QVBoxLayout root
+//         ├─ toolbar（48px 高）
+//         │     [Tinyopen] ................ [+ 新建分组] [⚙ 设置] [🕐 状况]
+//         └─ QScrollArea m_scroll（可滚动）
+//            └─ m_groupHost (QWidget)          ← 接收拖拽的容器
+//               └─ QVBoxLayout m_groupLayout（边距 16/14/16/16，间距 12）
+//                  ├─ GroupWidget …            ← 每个分组一块面板
+//                  ├─ m_dropIndicator (QFrame) ← 拖动时的蓝色插入线（平时不在布局里）
+//                  └─ addStretch()             ← 末尾拉伸，让分组从顶部开始排
+//
+// 【成员与职责】
+//   m_config          ConfigStore  读取启动间隔、读写全部分组数据
+//   m_logger          Logger       记录每次打开的结果
+//   m_launcher        Launcher     执行真正的打开动作
+//   m_dragGroup       正在被拖动的分组（仅拖动期间非空）
+//   m_batchDepth      >0 表示批量操作中：只同步内存、不写盘（启动还原 / 多文件拖入）
+//   m_indicatorIndex  插入指示线当前下标，用于跳过无谓的布局重排
+//
+// 【函数一览】
+//   ── 生命周期 ──────────────────────────────────────────────
+//     MainWindow()            搭界面 → 还原配置里的分组 → 安排开机自启
+//     ~MainWindow()           关闭前同步数据并落盘
+//   ── 界面搭建 ──────────────────────────────────────────────
+//     createToolbar()         构建顶部工具栏（标题 + 三个图标按钮）
+//     addGroupPanel()         新增一块分组面板，并接好它的全部信号
+//   ── 槽：分组 ──────────────────────────────────────────────
+//     onNewGroup()            新建空分组
+//     onGroupAddFiles()       点分组「+」→ 弹新增窗 → 加一行
+//     onGroupDelete()         删除分组
+//     onGroupLaunch()         启动整组
+//     onGroupLaunchFile()     启动某一行
+//     onGroupEditFile()       双击某行 → 弹编辑窗
+//     onAnyChanged()          任何改动 → 同步 + 保存（批量操作时暂缓写盘）
+//     syncGroupsToConfig()    按「布局顺序」把界面数据收集进 ConfigStore
+//   ── 槽：其它 ──────────────────────────────────────────────
+//     onSettings()            打开设置弹窗
+//     onStatus()              打开后台记录弹窗
+//   ── 拖放：拖入文件 ────────────────────────────────────────
+//     dragEnterEvent()        只接受「文件」拖入
+//     dropEvent()             松手 → 每个文件各建一个分组
+//     createGroupsFromPaths() 批量建分组（内部用 batch 合并写盘）
+//   ── 拖放：分组换位置 ──────────────────────────────────────
+//     eventFilter()           拦截 m_groupHost 的拖拽事件，分流两种拖拽
+//     insertionIndexAt()      由纵坐标算出应插入到第几个分组之前
+//     updateDropIndicator()   把蓝色插入线移到目标位置
+//     hideDropIndicator()     隐藏并摘除插入线
+//     performGroupReorder()   松手时真正调整分组顺序
 // =============================================================================
 
 #include "mainwindow.h"
@@ -35,6 +89,10 @@
 
 // 工具栏图标统一颜色（深蓝灰）
 static const QColor kIconColor(0x55, 0x5f, 0x6b);
+
+// 「拖动分组」用的 MIME 类型：只构造一次。
+// 拖拽过程中 DragMove 会高频触发，这里避免每次都新建 QString。
+static const QString kGroupMime = QString::fromLatin1(TINYOPEN_GROUP_MIME);
 
 // 构造：创建核心模块 → 搭建界面（工具栏 + 可滚动分组列表）→ 还原配置里的分组 → 执行开机自启
 MainWindow::MainWindow(QWidget *parent)
@@ -95,8 +153,15 @@ MainWindow::MainWindow(QWidget *parent)
     root->addWidget(m_scroll, 1);
 
     // ---------- 载入已保存的分组（连同文件条目一起还原） ----------
-    for (const GroupEntry &g : m_config->groups())
+    // 1) 先取一份快照：addGroupPanel 会回调 onAnyChanged 改动配置里的列表，
+    //    直接遍历 m_config->groups() 不安全；
+    // 2) 用 batch 把「每组各存一次盘」合并成最后统一存一次（原来 4 组要写 4 次文件）。
+    const QList<GroupEntry> savedGroups = m_config->groups();
+    ++m_batchDepth;
+    for (const GroupEntry &g : savedGroups)
         addGroupPanel(g.name, {}, &g);   // 直接把整个分组数据交给面板还原
+    --m_batchDepth;
+    m_config->save();
 
     // ---------- 开机自启：还原完分组后，依次打开所有勾选了「自动打开」的分组 ----------
     // 用 QTimer 排到事件循环之后，确保窗口先显示出来再启动文件
@@ -244,11 +309,13 @@ void MainWindow::onGroupEditFile(GroupWidget *g, int row)
         g->setFileAt(row, dlg.result());
 }
 
-// 任何数据变化 → 同步到 ConfigStore 并立即保存
+// 任何数据变化 → 同步到 ConfigStore 并保存。
+// 批量操作期间（m_batchDepth > 0）只同步内存，不写盘，由批量结束处统一保存一次。
 void MainWindow::onAnyChanged()
 {
     syncGroupsToConfig();
-    m_config->save();
+    if (m_batchDepth == 0)
+        m_config->save();
 }
 
 // 把界面上所有 GroupWidget 的数据收集成一个列表，存入 ConfigStore。
@@ -257,6 +324,7 @@ void MainWindow::onAnyChanged()
 void MainWindow::syncGroupsToConfig()
 {
     QList<GroupEntry> list;
+    list.reserve(m_groupLayout->count());   // 预分配，避免反复扩容
     for (int i = 0; i < m_groupLayout->count(); ++i) {
         auto *g = qobject_cast<GroupWidget *>(m_groupLayout->itemAt(i)->widget());
         if (g)
@@ -307,13 +375,20 @@ void MainWindow::dropEvent(QDropEvent *event)
     event->acceptProposedAction();
 }
 
-// 每个路径新建一个分组，分组名取文件名
+// 每个路径新建一个分组，分组名取文件名。
+// 一次拖入多个文件时用 batch 合并写盘，避免「每建一组写一次配置」。
 void MainWindow::createGroupsFromPaths(const QStringList &paths)
 {
+    if (paths.isEmpty())
+        return;
+
+    ++m_batchDepth;
     for (const QString &p : paths) {
         const QString base = QFileInfo(p).fileName();
         addGroupPanel(base.isEmpty() ? QStringLiteral("新分组") : base, {p});
     }
+    --m_batchDepth;
+    m_config->save();
 }
 
 // =============================================================================
@@ -333,7 +408,7 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
     case QEvent::DragEnter:
     case QEvent::DragMove: {
         auto *e = static_cast<QDropEvent *>(event);
-        if (e->mimeData()->hasFormat(QString::fromLatin1(TINYOPEN_GROUP_MIME))) {
+        if (e->mimeData()->hasFormat(kGroupMime)) {
             // 移动分组：接受并更新插入指示线位置
             updateDropIndicator(e->position().toPoint());
             e->acceptProposedAction();
@@ -351,7 +426,7 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
         return false;
     case QEvent::Drop: {
         auto *e = static_cast<QDropEvent *>(event);
-        if (e->mimeData()->hasFormat(QString::fromLatin1(TINYOPEN_GROUP_MIME))) {
+        if (e->mimeData()->hasFormat(kGroupMime)) {
             performGroupReorder(e->position().toPoint());
             hideDropIndicator();
             e->acceptProposedAction();
@@ -391,11 +466,17 @@ int MainWindow::insertionIndexAt(int y) const
     return idx;         // 落到最后
 }
 
-// 把插入指示线移动到对应位置（先摘出布局，再插到目标下标处）
+// 把插入指示线移动到对应位置。
+// DragMove 是高频事件，位置没变时直接返回，避免反复 remove/insert 造成布局抖动。
 void MainWindow::updateDropIndicator(const QPoint &posInHost)
 {
-    m_groupLayout->removeWidget(m_dropIndicator);   // 先摘掉，避免影响下标与几何计算
+    // insertionIndexAt 只统计分组、会跳过指示线本身，所以「先算再摘」是安全的
     const int idx = insertionIndexAt(posInHost.y());
+    if (idx == m_indicatorIndex && m_dropIndicator->isVisible())
+        return;
+
+    m_indicatorIndex = idx;
+    m_groupLayout->removeWidget(m_dropIndicator);
     m_groupLayout->insertWidget(idx, m_dropIndicator);
     m_dropIndicator->show();
 }
@@ -405,6 +486,7 @@ void MainWindow::hideDropIndicator()
 {
     if (!m_dropIndicator)
         return;
+    m_indicatorIndex = -1;
     m_groupLayout->removeWidget(m_dropIndicator);
     m_dropIndicator->hide();
 }

@@ -1,15 +1,41 @@
 // =============================================================================
-// groupwidget.h — 分组面板
-// -----------------------------------------------------------------------------
-// 界面结构：
-//   ┌──────────────────────────────────────────┐
-//   │ 浅蓝标题栏： 分组名(可点击改名)  [电源][+][▶][🗑] │
-//   ├──────────────────────────────────────────┤
-//   │ 文件行 1  (FileItemWidget)                 │
-//   │ 文件行 2  ...                              │
-//   └──────────────────────────────────────────┘
-// 功能：重命名、添加/启动/删除、拖入文件、开机自启开关、按首个文件自动改名。
-// 注意：本类用样式表画背景/边框，构造函数里必须 setAttribute(WA_StyledBackground, true)。
+// groupwidget.h — 分组面板（一块「分组」卡片）
+// =============================================================================
+//
+// 【界面结构】
+//   ┌──────────────────────────────────────────────────────┐
+//   │ 浅蓝标题栏： 分组名（点击可改名）   [🔌][＋][▶][🗑]   │
+//   ├──────────────────────────────────────────────────────┤
+//   │  FileItemWidget  第 1 行                             │
+//   │  FileItemWidget  第 2 行                             │
+//   │  …（没有文件时显示「把文件拖到这里…」的灰色提示）      │
+//   └──────────────────────────────────────────────────────┘
+//   标题栏右侧四个按钮依次是：🔌 开机自启 / ＋ 添加文件 / ▶ 启动整组 / 🗑 删除分组
+//
+// 【职责】
+//   * 展示并维护「一个分组」的全部数据（分组名、文件行、开机自启标记）；
+//   * 改名：点击标题栏上的分组名 → 原地变成输入框；
+//   * 添加 / 删除文件行；编辑请求转发给主窗口（弹窗由主窗口负责）；
+//   * 接收从资源管理器拖进来的文件；
+//   * 按住标题栏拖动 → 发起「移动整个分组」的拖拽；
+//   * 任何内容变化 emit changed，由主窗口统一保存。
+//
+// 【类结构】
+//   公有    ：entry() / groupName() / fileAt() / setFileAt() / autoLaunch() / setAutoLaunch()
+//   公有槽  ：addFiles() / addFile() / loadGroup()      —— 供主窗口或拖放调用
+//   信号    ：request*（请求主窗口做事）/ dragStarted、dragFinished（拖动）/ changed（需保存）
+//   受保护  ：dragEnterEvent、dropEvent（接收拖入文件）/ eventFilter（改名 + 拖动）
+//   私有    ：rebuildRows / appendRow / updateEmptyHint / updateAutoButton /
+//             updateMinimumHeight / startGroupDrag / rowIndex / maybeAutoRename
+//   成员    ：m_entry（本组数据）、m_rows（行控件列表）、m_rowLayout（行布局）、
+//             标题栏与四个按钮指针、m_headerPressPos（拖动起点）、
+//             m_minHeightQueued（最小高度重算去重标志）
+//
+// 【关键约束】
+//   1. 本类用样式表画背景/边框，构造时必须 setAttribute(WA_StyledBackground, true)；
+//   2. 最小高度必须跟随内容高度（见 updateMinimumHeight 的详细说明），
+//      否则内容超出视口时分组会被压扁，Qt 会把行间距压成负值 → 文件行重叠；
+//   3. 「移动分组」用 TINYOPEN_GROUP_MIME 标记，与「拖入文件」区分开。
 // =============================================================================
 
 #ifndef GROUPWIDGET_H
@@ -85,6 +111,7 @@ private:
     void appendRow(const FileEntry &entry);     // 追加一行文件行
     void updateEmptyHint();                     // 根据是否有文件显示/隐藏空提示
     void updateAutoButton();                    // 刷新开机自启按钮状态
+    void updateMinimumHeight();                 // 让最小高度跟上内容高度（防止被压缩重叠）
     void startGroupDrag();                      // 发起「拖动整个分组」的 QDrag
     int rowIndex(const FileItemWidget *row) const;   // 由行控件反查其在列表中的下标
 
@@ -97,6 +124,7 @@ private:
 
     QWidget     *m_headerBar = nullptr; // 标题栏（按住它可拖动整个分组）
     QPoint       m_headerPressPos;      // 标题栏按下时的坐标（用于判断是否开始拖动）
+    bool         m_minHeightQueued = false;  // 「最小高度重算」是否已排队（避免重复排定时器）
 
     QLabel      *m_nameLabel = nullptr; // 分组名（展示态）
     QLineEdit   *m_nameEdit  = nullptr; // 分组名（编辑态）

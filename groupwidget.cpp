@@ -1,9 +1,48 @@
 // =============================================================================
 // groupwidget.cpp — 分组面板实现
-// -----------------------------------------------------------------------------
-// 布局：根布局 root [ 标题栏 headerBar(名称+4个按钮) | 文件区 rowHost(文件行) ]
-// 样式用 QSS 描述（白底圆角 + 标题栏浅蓝底），因此自定义 QWidget 必须开启
-// WA_StyledBackground 才能绘制背景/边框。
+// =============================================================================
+//
+// 【布局树】
+//   GroupWidget（白底圆角卡片，背景/边框由 QSS 绘制）
+//   └─ QVBoxLayout root（边距 0，间距 0）
+//      ├─ headerBar（浅蓝底，由 QSS 绘制）
+//      │   └─ QHBoxLayout（边距 14/10/14/10，间距 6）
+//      │        名称标签 m_nameLabel ─ 名称输入框 m_nameEdit（改名时才显示）
+//      │        ─ 弹簧 ─ 🔌 m_autoBtn ─ ＋ m_addBtn ─ ▶ m_launchBtn ─ 🗑 m_deleteBtn
+//      └─ rowHost（QWidget，边距 10/8/10/10）
+//          └─ QVBoxLayout rowHostLayout
+//             └─ QVBoxLayout m_rowLayout（行间距 4）
+//                ├─ FileItemWidget …（每个文件一行）
+//                ├─ m_emptyHint（空分组提示，有文件时隐藏）
+//                └─ addStretch()（让文件行始终贴顶）
+//
+// 【函数一览】
+//   ── 构造 ──────────────────────────────────────────────────
+//     GroupWidget()          搭界面、连信号、装事件过滤器、首次重建文件行
+//   ── 状态刷新 ──────────────────────────────────────────────
+//     updateAutoButton()     刷新电源按钮的图标颜色与提示文字
+//     updateEmptyHint()      按「有无文件」显示/隐藏空提示
+//     updateMinimumHeight()  让最小高度跟随内容（防止被压扁导致行重叠）
+//   ── 文件行管理 ────────────────────────────────────────────
+//     rebuildRows()          清空并按 m_entry.files 重建全部行
+//     appendRow()            追加一行，并接好该行的启动/删除/编辑信号
+//     rowIndex()             由行控件反查它在列表中的下标
+//   ── 数据读写 ──────────────────────────────────────────────
+//     entry()                取出整个分组数据
+//     fileAt() / setFileAt() 读 / 改第 index 行
+//     loadGroup()            用完整数据还原（主窗口从配置恢复时调用）
+//   ── 添加内容 ──────────────────────────────────────────────
+//     addFiles()             把拖入的本地路径批量加成行
+//     addFile()              弹窗新增一条（可能是文件，也可能是网址）
+//     maybeAutoRename()      分组仍叫「新分组」时，按首个文件自动改名
+//   ── 改名 ──────────────────────────────────────────────────
+//     onRenameClicked()      点击名称 → 原地切换成输入框
+//     onNameEdited()         输入完成 → 写回数据并触发保存
+//   ── 交互 ──────────────────────────────────────────────────
+//     eventFilter()          点击改名 + 按住标题栏拖动
+//     startGroupDrag()       发起「移动整个分组」的 QDrag
+//     dragEnterEvent()       拖入文件时接受
+//     dropEvent()            松手后把文件加进本组
 // =============================================================================
 
 #include "groupwidget.h"
@@ -18,11 +57,13 @@
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLayout>
 #include <QLineEdit>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QRegularExpression>
 #include <QSizePolicy>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -186,6 +227,7 @@ void GroupWidget::rebuildRows()
     for (const FileEntry &e : m_entry.files)
         appendRow(e);
     updateEmptyHint();
+    updateMinimumHeight();
 }
 
 // 追加一行文件行，并把它的事件连接到本类的处理逻辑
@@ -215,6 +257,7 @@ void GroupWidget::appendRow(const FileEntry &entry)
         m_rowLayout->removeWidget(r);
         r->deleteLater();
         updateEmptyHint();
+        updateMinimumHeight();   // 少了一行 → 最小高度也要跟着收
         emit changed();
     });
     // 双击该行 → 请求主窗口弹出编辑窗
@@ -222,6 +265,36 @@ void GroupWidget::appendRow(const FileEntry &entry)
         const int i = rowIndex(r);
         if (i >= 0)
             emit requestEditFile(this, i);  // 由主窗口弹出编辑弹窗
+    });
+
+    updateMinimumHeight();   // 多了一行 → 最小高度要跟着长
+}
+
+// 让「最小高度」始终等于内容真正需要的高度（至少 120）。
+// 为什么必须这样：
+//   QScrollArea 开了 widgetResizable 后，只会把容器撑到「布局的最小高度」，
+//   而分组若把最小高度固定成 120，内容更高的分组就会被外层布局强行压扁；
+//   Qt 在空间不足时会把行间距压成负值 —— 于是文件行互相重叠。
+//   所以最小高度必须跟随内容，外层才压不动它，滚动条也才会正确出现。
+// 为什么要用 QTimer 推迟：
+//   刚插入文件行时，布局的最小高度缓存还是旧的（要等事件循环里重新计算），
+//   这时直接读会读到偏小的值，等于没生效。推迟到事件循环后再读才是准的。
+void GroupWidget::updateMinimumHeight()
+{
+    QLayout *lay = layout();
+    if (!lay)
+        return;
+    setMinimumHeight(qMax(120, lay->minimumSize().height()));   // 先按当前值设一次
+
+    // 同一轮里可能被连续调用多次（每加一行都会调），只排一个定时器就够，
+    // 否则批量还原 N 行就会排 N 个 lambda。
+    if (m_minHeightQueued)
+        return;
+    m_minHeightQueued = true;
+    QTimer::singleShot(0, this, [this] {
+        m_minHeightQueued = false;
+        if (QLayout *l = layout())
+            setMinimumHeight(qMax(120, l->minimumSize().height()));
     });
 }
 
@@ -299,8 +372,10 @@ void GroupWidget::maybeAutoRename(const FileEntry &firstAdded)
 
     // 网址：直接用地址作为分组名（不做去扩展名处理）
     if (looksLikeUrl(firstAdded.path)) {
+        // 正则只构造一次（static），避免每次改名都编译一遍
+        static const QRegularExpression schemeRe(QStringLiteral("^[a-zA-Z]+://"));
         QString host = normalizeUrl(firstAdded.path);
-        host.remove(QRegularExpression(QStringLiteral("^[a-zA-Z]+://")));
+        host.remove(schemeRe);
         host = host.section(QLatin1Char('/'), 0, 0);   // 取域名部分
         if (!host.isEmpty()) {
             m_entry.name = host;
@@ -423,6 +498,10 @@ void GroupWidget::startGroupDrag()
     emit dragStarted(this);        // 通知主窗口：正在拖动本分组
     drag->exec(Qt::MoveAction);    // 阻塞，直到松手
     emit dragFinished();           // 通知主窗口：拖动结束，隐藏指示线
+
+    // QDrag 不会自动释放；不删的话每拖一次就多留一个对象（及其 QMimeData）。
+    // 用 deleteLater 交给事件循环，避免在 exec 返回的同一调用栈里析构。
+    drag->deleteLater();
 }
 
 // 拖拽进入：有 URL（拖入文件）才接受；分组换位置的拖拽交给主窗口处理
